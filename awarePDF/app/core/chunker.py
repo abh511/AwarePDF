@@ -18,7 +18,7 @@ from config.settings import CHUNK_SIZE, CHUNK_OVERLAP
 logger = get_logger(__name__)
 
 
-def chunk_documents(raw_chunks: list[dict]) -> list[dict]:
+def chunk_with_metadata(raw_chunks: list[dict]) -> list[dict]:
     """
     Takes raw chunks from pdf_processor and splits long ones further.
     Tables, headings, and figure captions are NOT split - they're kept whole.

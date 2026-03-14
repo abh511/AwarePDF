@@ -87,8 +87,8 @@ def _prepare_metadata(chunk: dict) -> dict:
 		"page_number": source_meta.get("page_number", chunk.get("page_number")),
 		"chunk_index": source_meta.get("chunk_index", chunk.get("chunk_index")),
 		"content_type": source_meta.get("content_type", chunk.get("content_type", "text")),
-		"section_heading": source_meta.get("section_heading", chunk.get("section_heading")),
-		"pdf_filename": source_meta.get("pdf_filename", chunk.get("pdf_filename")),
+		"section": source_meta.get("section", chunk.get("section", "")),
+		"is_important": source_meta.get("is_important", chunk.get("is_important", False)),
 	}
 
 	# Chroma metadata values must be primitive scalars; drop missing values.

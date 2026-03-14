@@ -23,6 +23,11 @@ docling
 
 # LLM API
 groq
+google-generativeai
+
+# Utilities
+tenacity
+rich
 
 # Testing
 pytest

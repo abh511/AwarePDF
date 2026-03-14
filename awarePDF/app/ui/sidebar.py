@@ -7,7 +7,7 @@ import streamlit as st
 from pathlib import Path
 from app.utils.file_handler import save_uploaded_file, get_pdf_hash, get_file_size_mb
 from app.core.pdf_processor import process_pdf
-from app.core.chunker import chunk_documents
+from app.core.chunker import chunk_with_metadata
 from app.core.vector_store import (
     collection_exists,
     add_documents,
@@ -92,7 +92,7 @@ def render_sidebar() -> dict:
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        def update_progress(message: str, percent: float):
+        def update_progress(percent: float, message: str):
             progress_bar.progress(percent)
             status_text.text(message)
 
@@ -102,7 +102,7 @@ def render_sidebar() -> dict:
 
             # Step 2: Chunk
             update_progress("Chunking content...", 0.7)
-            final_chunks = chunk_documents(raw_chunks)
+            final_chunks = chunk_with_metadata(raw_chunks)
 
             # Step 3: Store in ChromaDB
             update_progress("Storing in vector database...", 0.85)

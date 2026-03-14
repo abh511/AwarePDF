@@ -24,7 +24,6 @@ def extract_topics(pdf_hash: str) -> str:
         collection,
         query="chapter section topic introduction overview",
         k=20,
-        filter_type="heading",
     )
 
     # Also get some general content for context
