@@ -1,0 +1,28 @@
+# Core App
+streamlit
+python-dotenv
+Pillow
+
+# LLM / LangChain
+langchain
+langchain-community
+langchain-groq
+tiktoken
+
+# Vector Database
+chromadb
+
+# Embeddings
+sentence-transformers
+transformers
+torch
+
+# Document Processing
+pypdf
+docling
+
+# LLM API
+groq
+
+# Testing
+pytest
