@@ -1,21 +1,23 @@
 # ============================================================
 # app/ui/dashboard.py
-# Dashboard - Summary, Topics, Key Points tabs
+# Dashboard - Summary, Topics, Key Points, Images tabs
 # ============================================================
 
 import streamlit as st
+from pathlib import Path
 from app.features.summarizer import summarize_pdf
 from app.features.key_points import extract_key_points
 from app.features.topic_extractor import extract_topics
+from app.core.image_extractor import get_image_paths_for_pdf
 
 
 def render_dashboard(pdf_hash: str, pdf_name: str):
-    """Renders the 3-tab dashboard: Summary | Topics | Key Points"""
+    """Renders the 4-tab dashboard: Summary | Topics | Key Points | Images"""
 
     st.subheader("📊 Document Intelligence")
     st.caption(f"Analyzing: **{pdf_name}**")
 
-    tab1, tab2, tab3 = st.tabs(["📝 Summary", "🗂️ Topics", "⭐ Key Points"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📝 Summary", "🗂️ Topics", "⭐ Key Points", "📸 Images"])
 
     # --- SUMMARY TAB ---
     with tab1:
@@ -47,3 +49,25 @@ def render_dashboard(pdf_hash: str, pdf_name: str):
                     topic=topic_filter if topic_filter else None,
                 )
             st.markdown(key_points)
+
+    # --- IMAGES TAB ---
+    with tab4:
+        st.write("Diagrams, figures, and images extracted from the document.")
+        images = get_image_paths_for_pdf(pdf_hash)
+
+        if not images:
+            st.info("No images extracted yet. Images are extracted during PDF processing.")
+        else:
+            st.success(f"📸 Found {len(images)} images/diagrams")
+
+            # Display images in a grid (3 columns)
+            cols = st.columns(3)
+            for idx, img_info in enumerate(images):
+                img_path = Path(img_info["path"])
+                if img_path.exists():
+                    with cols[idx % 3]:
+                        st.image(
+                            str(img_path),
+                            caption=f"Page {img_info['page_number']} — {img_info['filename']}",
+                            use_container_width=True,
+                        )

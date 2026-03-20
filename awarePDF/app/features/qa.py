@@ -47,7 +47,9 @@ def answer_question(pdf_hash: str, question: str, chat_history: list = None) -> 
         sources.append({
             "page": meta.get("page_number", "?"),
             "section": meta.get("section", ""),
-            "preview": chunk["text"][:150] + "...",
+            "preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
+            "content_type": meta.get("content_type", "text"),
+            "image_path": chunk.get("image_path", ""),
         })
 
     return {"answer": answer, "sources": sources, "context_used": context}

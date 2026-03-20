@@ -5,6 +5,7 @@ Pillow
 
 # LLM / LangChain
 langchain
+langchain-text-splitters
 langchain-community
 langchain-groq
 tiktoken
@@ -20,8 +21,9 @@ torch
 # Document Processing
 pypdf
 docling
+PyMuPDF  # provides the `fitz` module for image extraction
 
-# LLM API
+# LLM APIs
 groq
 google-generativeai
 

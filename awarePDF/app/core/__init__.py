@@ -3,6 +3,7 @@
 __all__ = [
 	"chunker",
 	"embedder",
+	"image_extractor",
 	"llm",
 	"pdf_processor",
 	"retriever",

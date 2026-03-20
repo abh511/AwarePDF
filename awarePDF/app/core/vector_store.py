@@ -201,8 +201,21 @@ def add_documents(collection: Collection, chunks: list[dict]) -> None:
 			logger.warning("No valid chunks to add for collection '%s'.", collection.name)
 			return
 
-		collection.add(documents=documents, metadatas=metadatas, ids=ids)
-		logger.info("Added %s chunks to collection '%s'.", len(documents), collection.name)
+		# Batch insert for large PDFs (600+ pages can produce thousands of chunks)
+		BATCH_SIZE = 500
+		for start in range(0, len(documents), BATCH_SIZE):
+			end = min(start + BATCH_SIZE, len(documents))
+			collection.add(
+				documents=documents[start:end],
+				metadatas=metadatas[start:end],
+				ids=ids[start:end],
+			)
+			logger.info(
+				"Added batch %s-%s of %s chunks to collection '%s'.",
+				start, end, len(documents), collection.name,
+			)
+
+		logger.info("Added %s total chunks to collection '%s'.", len(documents), collection.name)
 	except Exception:
 		logger.exception("Failed to add documents to collection '%s'.", collection.name)
 		raise

@@ -20,6 +20,32 @@ from config.settings import RETRIEVAL_K
 
 logger = get_logger(__name__)
 
+_cross_encoder = None
+
+
+def _get_cross_encoder():
+    """Return cached CrossEncoder model (singleton)."""
+    global _cross_encoder
+    if _cross_encoder is None:
+        from sentence_transformers import CrossEncoder
+        logger.info("Loading CrossEncoder model (one-time)...")
+        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _cross_encoder
+
+
+def _rerank(query: str, candidates: list[dict]) -> list[dict]:
+    """
+    Uses a cross-encoder to rerank candidates by true relevance.
+    Cross-encoder reads query+chunk together for much better scoring
+    than cosine similarity alone.
+    """
+    model = _get_cross_encoder()
+    pairs = [[query, chunk["text"]] for chunk in candidates]
+    scores = model.predict(pairs)
+    for chunk, score in zip(candidates, scores):
+        chunk["rerank_score"] = float(score)
+    return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+
 
 def retrieve(
     pdf_hash: str,
@@ -31,83 +57,56 @@ def retrieve(
     Main retrieval function. Returns top-k most relevant chunks.
 
     Args:
-        pdf_hash: The PDF's MD5 hash (used to find correct collection)
+        pdf_hash: The PDF's SHA-256 hash (ChromaDB collection ID)
         query: User's question
         k: Number of final chunks to return
-        use_reranker: Whether to apply reranking (slower but better)
-
-    Returns:
-        List of chunk dicts ordered by relevance
+        use_reranker: Whether to apply cross-encoder reranking
     """
     k = k or RETRIEVAL_K
-
     collection = create_or_get_collection(pdf_hash)
 
-    # Stage 1: Get more candidates than needed (we'll rerank and cut down)
+    # Fetch more candidates than needed so reranker has room to work
     candidates_k = k * 3 if use_reranker else k
     candidates = similarity_search(collection, query, k=candidates_k)
 
     if not candidates:
-        logger.warning(f"No results found for query: {query}")
+        logger.warning("No results found for query: %s", query)
         return []
 
     if not use_reranker:
         return candidates[:k]
 
-    # Stage 2: Rerank
     try:
         reranked = _rerank(query, candidates)
+        logger.info("Reranked %s candidates → returning top %s", len(candidates), k)
         return reranked[:k]
-    except Exception as e:
-        logger.warning(f"Reranking failed ({e}), falling back to vector results")
+    except Exception as exc:
+        logger.warning("Reranking failed (%s), falling back to vector results", exc)
         return candidates[:k]
 
 
-def _rerank(query: str, candidates: list[dict]) -> list[dict]:
-    """
-    Uses a cross-encoder to rerank candidates by true relevance.
-
-    Cross-encoder model: 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-    - Small (~80MB), fast on CPU
-    - Much more accurate than cosine similarity for final ranking
-    """
-    from sentence_transformers import CrossEncoder
-
-    model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-    # Build pairs of [query, chunk_text] for the cross-encoder
-    pairs = [[query, chunk["text"]] for chunk in candidates]
-    scores = model.predict(pairs)
-
-    # Attach scores and sort descending (higher = more relevant)
-    for chunk, score in zip(candidates, scores):
-        chunk["rerank_score"] = float(score)
-
-    reranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
-    logger.info(f"Reranked {len(candidates)} candidates")
-    return reranked
-
-
-def retrieve_for_summary(pdf_hash: str, max_chunks: int = 30) -> list[dict]:
+def retrieve_for_summary(pdf_hash: str, max_chunks: int = 40) -> list[dict]:
     """
     Special retrieval for summarization - gets a broad spread of chunks
     from across the document rather than focusing on one query.
-    Used by the summarizer feature.
+
+    Deduplicates by section to ensure coverage across the whole document.
     """
     collection = create_or_get_collection(pdf_hash)
 
-    # Get headings and important chunks first (they represent key ideas)
     important = similarity_search(
         collection,
-        query="main topics key concepts summary overview",
+        query="main topics key concepts summary overview introduction",
         k=max_chunks,
     )
 
-    # Deduplicate by section
-    seen_sections = set()
-    diverse_chunks = []
+    # Deduplicate by section to get broad coverage
+    seen_sections: set[str] = set()
+    diverse_chunks: list[dict] = []
     for chunk in important:
-        section = chunk["metadata"].get("section", "")
+        # metadata is nested under "metadata" key in similarity_search results
+        meta = chunk.get("metadata", {})
+        section = meta.get("section", chunk.get("section", ""))
         if section not in seen_sections or not section:
             diverse_chunks.append(chunk)
             seen_sections.add(section)

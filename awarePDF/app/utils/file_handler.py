@@ -30,16 +30,14 @@ def save_uploaded_file(uploaded_file) -> str:
 
 def get_pdf_hash(file_path: str) -> str:
     """
-    Returns MD5 hash of a PDF file.
-    This is used as the unique collection name in ChromaDB.
-
-    Why MD5? It's fast and we're not doing security here,
-    just checking if this exact file was already processed.
+    Returns SHA-256 hash of a PDF file.
+    This is used as the unique collection name in ChromaDB
+    and must match pdf_processor._compute_pdf_hash().
     """
-    hasher = hashlib.md5()
+    hasher = hashlib.sha256()
     with open(file_path, "rb") as f:
-        # Read in chunks - handles large PDFs without loading all into RAM
-        for chunk in iter(lambda: f.read(8192), b""):
+        # Read in 1MB chunks - handles large PDFs without loading all into RAM
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
 

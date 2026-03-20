@@ -11,3 +11,11 @@ venv/
 
 # Editor folders
 .vscode/
+
+# Environment files - NEVER commit real API keys
+.env
+**/.env
+
+# Data directories - uploads, processed cache, vector DB, images
+data/
+awarePDF/data/
