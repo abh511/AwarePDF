@@ -1,114 +1,173 @@
-# ============================================================
-# app/core/retriever.py
-# Retrieval logic - given a query, finds the best chunks
-#
-# TWO STAGE RETRIEVAL:
-# Stage 1 - Vector search: Fast, finds semantically similar chunks
-# Stage 2 - Reranking: Slower but more precise, reorders by relevance
-#
-# WHY RERANK?
-# Vector search finds "nearby" vectors but doesn't deeply compare
-# query vs chunk. A cross-encoder reranker reads both together
-# and gives a much better relevance score. Think of it as:
-# - Vector search = shortlist 10 candidates quickly
-# - Reranker = carefully interview those 10, pick top 3
-# ============================================================
+"""Retrieval for Q&A plus whole-document views for summaries and outlines.
 
-from app.core.vector_store import similarity_search, create_or_get_collection
+Q&A pipeline:
+1. Dense search (BGE embeddings)  ┐
+2. Keyword search (BM25)          ┴→ Reciprocal Rank Fusion → top candidates
+3. Cross-encoder reranking → top-k
+
+Whole-book features (summary, topics) can't rely on similarity search: a
+handful of generic queries only reaches a small slice of a 700-page book.
+They use the heading outline and an even sample across all pages instead.
+"""
+
+import re
+
+from app.core import hybrid_search, reranker, vector_store
 from app.utils.logger import get_logger
-from config.settings import RETRIEVAL_K
+from config.settings import RETRIEVAL_K, CANDIDATES_K, USE_RERANKER
 
 logger = get_logger(__name__)
 
-_cross_encoder = None
+
+def _require_collection(pdf_hash: str):
+    collection = vector_store.get_collection(pdf_hash)
+    if collection is None:
+        raise ValueError("This PDF has not been indexed yet.")
+    return collection
 
 
-def _get_cross_encoder():
-    """Return cached CrossEncoder model (singleton)."""
-    global _cross_encoder
-    if _cross_encoder is None:
-        from sentence_transformers import CrossEncoder
-        logger.info("Loading CrossEncoder model (one-time)...")
-        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    return _cross_encoder
-
-
-def _rerank(query: str, candidates: list[dict]) -> list[dict]:
-    """
-    Uses a cross-encoder to rerank candidates by true relevance.
-    Cross-encoder reads query+chunk together for much better scoring
-    than cosine similarity alone.
-    """
-    model = _get_cross_encoder()
-    pairs = [[query, chunk["text"]] for chunk in candidates]
-    scores = model.predict(pairs)
-    for chunk, score in zip(candidates, scores):
-        chunk["rerank_score"] = float(score)
-    return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
-
-
-def retrieve(
-    pdf_hash: str,
-    query: str,
-    k: int = None,
-    use_reranker: bool = True,
-) -> list[dict]:
-    """
-    Main retrieval function. Returns top-k most relevant chunks.
-
-    Args:
-        pdf_hash: The PDF's SHA-256 hash (ChromaDB collection ID)
-        query: User's question
-        k: Number of final chunks to return
-        use_reranker: Whether to apply cross-encoder reranking
-    """
+def retrieve(pdf_hash: str, query: str, k: int | None = None) -> list[dict]:
+    """Return the k most relevant chunks for a query."""
     k = k or RETRIEVAL_K
-    collection = create_or_get_collection(pdf_hash)
+    collection = _require_collection(pdf_hash)
 
-    # Fetch more candidates than needed so reranker has room to work
-    candidates_k = k * 3 if use_reranker else k
-    candidates = similarity_search(collection, query, k=candidates_k)
+    dense = vector_store.similarity_search(collection, query, k=CANDIDATES_K)
+    sparse = hybrid_search.bm25_search(collection, query, k=CANDIDATES_K)
+    candidates = hybrid_search.reciprocal_rank_fusion([dense, sparse], k=CANDIDATES_K)
 
-    if not candidates:
-        logger.warning("No results found for query: %s", query)
+    if USE_RERANKER and len(candidates) > k:
+        results = reranker.rerank(query, candidates, top_k=k)
+    else:
+        results = candidates[:k]
+
+    logger.info("Retrieval: %s dense + %s keyword → %s fused → %s final",
+                len(dense), len(sparse), len(candidates), len(results))
+    return results
+
+
+def get_outline(pdf_hash: str) -> list[dict]:
+    """All headings in reading order."""
+    collection = _require_collection(pdf_hash)
+    return vector_store.get_chunks(collection, where={"content_type": "heading"})
+
+
+_SUBSECTION_RE = re.compile(r"^\d+(\.\d+)+\s")
+
+
+def outline_text(pdf_hash: str, max_chars: int = 2500) -> str:
+    """
+    Compact heading outline with page numbers, for structure questions.
+    Drops numbered subsections (1.2, 3.4.1 ...) first if the outline is too long.
+    """
+    lines: list[str] = []
+    for heading in get_outline(pdf_hash):
+        text = heading["text"].strip()
+        line = f"- {text} (Page {heading['metadata'].get('page_number', '?')})"
+        if not lines or not lines[-1].startswith(f"- {text} ("):
+            lines.append(line)
+    if sum(len(line) + 1 for line in lines) > max_chars:
+        lines = [line for line in lines if not _SUBSECTION_RE.match(line[2:])]
+    total = sum(len(line) + 1 for line in lines)
+    if total > max_chars:
+        keep = max(1, int(len(lines) * max_chars / total))
+        lines = [lines[int(i * len(lines) / keep)] for i in range(keep)]
+    return "\n".join(lines)
+
+
+_NUMBER_RE = re.compile(r"^(?:chapter|unit|module|part)?\s*(\d+(?:\.\d+)*)\.?(?:\s|$)", re.IGNORECASE)
+
+
+def _section_number(text: str) -> str | None:
+    """"3.4 Stop wait" -> "3.4", "Chapter 2. Intro" -> "2", "ERROR CONTROL" -> None."""
+    match = _NUMBER_RE.match(text)
+    return match.group(1) if match else None
+
+
+def _inside(number: str, prefix: str) -> bool:
+    return number == prefix or number.startswith(prefix + ".")
+
+
+def _section_pages(pdf_hash: str, focus: str) -> tuple[int, int] | None:
+    """
+    Page range of the heading that best matches `focus`. None if no heading matches.
+
+    Numbered books end the range where numbering leaves the section ("3" covers
+    3.1-3.9 and stops at 4.1); unnumbered books stop at the next heading of the
+    same or higher level.
+    """
+    headings = [(h["text"].strip(), h["metadata"].get("page_number", 0)) for h in get_outline(pdf_hash)]
+    counts: dict[str, int] = {}
+    for text, _ in headings:
+        counts[text.lower()] = counts.get(text.lower(), 0) + 1
+    # Text repeated on many pages is a running header, not a section
+    headings = [(t, p) for t, p in headings if counts[t.lower()] < 3]
+
+    words = re.findall(r"\w+", focus.lower())
+    matches = [
+        (len((_section_number(t) or "").split(".")) if _section_number(t) else 0, i)
+        for i, (t, _) in enumerate(headings)
+        if words and all(w in t.lower() for w in words)
+    ]
+    if not matches:
+        return None
+    _, index = min(matches)  # prefer chapter titles over numbered subsections
+    title, start = headings[index]
+
+    number = _section_number(title)
+    if number is None:
+        # Chapter banners are unnumbered: take the number of their first subsection
+        for text, page in headings[max(0, index - 5):index + 6]:
+            sub = _section_number(text)
+            if sub and start <= page <= start + 1:
+                number = sub.split(".")[0]
+                break
+
+    if number is not None:
+        for text, page in headings[index + 1:]:
+            other = _section_number(text)
+            if other and page > start and not _inside(other, number):
+                # Chapters start on a fresh page; subsections share the boundary page
+                return start, page if "." in number else page - 1
+        return start, 10**9
+
+    for text, page in headings[index + 1:]:
+        if page > start and _section_number(text) is None:
+            return start, page - 1
+    return start, 10**9
+
+
+def _even_sample(chunks: list[dict], max_chars: int) -> list[dict]:
+    if not chunks:
         return []
-
-    if not use_reranker:
-        return candidates[:k]
-
-    try:
-        reranked = _rerank(query, candidates)
-        logger.info("Reranked %s candidates → returning top %s", len(candidates), k)
-        return reranked[:k]
-    except Exception as exc:
-        logger.warning("Reranking failed (%s), falling back to vector results", exc)
-        return candidates[:k]
+    avg_len = sum(len(c["text"]) for c in chunks) / len(chunks) + 60  # + citation header
+    n = max(1, min(len(chunks), int(max_chars // avg_len)))
+    step = len(chunks) / n
+    return [chunks[int(i * step)] for i in range(n)]
 
 
-def retrieve_for_summary(pdf_hash: str, max_chunks: int = 40) -> list[dict]:
+def chunks_for_topic(pdf_hash: str, topic: str, max_chars: int, k: int = 15) -> list[dict]:
     """
-    Special retrieval for summarization - gets a broad spread of chunks
-    from across the document rather than focusing on one query.
-
-    Deduplicates by section to ensure coverage across the whole document.
+    Content for a focused summary/key points: the whole matching chapter or
+    section when `topic` names a heading, otherwise the best search results.
     """
-    collection = create_or_get_collection(pdf_hash)
+    pages = _section_pages(pdf_hash, topic)
+    if pages:
+        start, end = pages
+        chunks = [
+            c for c in vector_store.get_chunks(_require_collection(pdf_hash), where=vector_store.SEARCHABLE)
+            if start <= c["metadata"].get("page_number", 0) <= end
+        ]
+        if chunks:
+            logger.info("Topic '%s' → pages %s-%s (%s chunks)", topic, start, end, len(chunks))
+            return _even_sample(chunks, max_chars)
+    return retrieve(pdf_hash, topic, k=k)
 
-    important = similarity_search(
-        collection,
-        query="main topics key concepts summary overview introduction",
-        k=max_chunks,
-    )
 
-    # Deduplicate by section to get broad coverage
-    seen_sections: set[str] = set()
-    diverse_chunks: list[dict] = []
-    for chunk in important:
-        # metadata is nested under "metadata" key in similarity_search results
-        meta = chunk.get("metadata", {})
-        section = meta.get("section", chunk.get("section", ""))
-        if section not in seen_sections or not section:
-            diverse_chunks.append(chunk)
-            seen_sections.add(section)
+def sample_across_document(pdf_hash: str, max_chars: int) -> list[dict]:
+    """
+    Evenly spaced chunks from the first page to the last, fitting max_chars.
+    Gives summaries and key points coverage of the entire book.
+    """
+    chunks = vector_store.get_chunks(_require_collection(pdf_hash), where=vector_store.SEARCHABLE)
+    return _even_sample(chunks, max_chars)
 
-    return diverse_chunks[:max_chunks]

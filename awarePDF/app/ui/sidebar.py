@@ -1,141 +1,141 @@
 # ============================================================
 # app/ui/sidebar.py
-# Left sidebar - file upload, PDF info, processing pipeline
+# Sidebar - file upload, processing, and navigation
 # ============================================================
 
 import streamlit as st
-from pathlib import Path
-from pypdf import PdfReader
 
-from app.utils.file_handler import save_uploaded_file, get_pdf_hash, get_file_size_mb
-from app.core.pdf_processor import process_pdf
+from app.utils.file_handler import save_uploaded_file, get_pdf_hash
+from app.core.pdf_processor import process_pdf, get_page_count
+from app.core.image_extractor import start_background_description, description_progress
 from app.core.vector_store import (
-    collection_exists,
-    add_documents,
-    get_collection_stats,
-    create_or_get_collection,
-    initialize_vector_store,
+    is_indexed, index_chunks, get_chunk_count, delete_collection,
+    images_pending, add_image_chunks, mark_images_done,
 )
 from app.utils.logger import get_logger
 from config.settings import MAX_UPLOAD_SIZE_MB, validate_keys
 
 logger = get_logger(__name__)
 
+VIEWS = {
+    "💬 Ask Questions": "chat",
+    "📝 Summary": "summary",
+    "🗂️ Topics": "topics",
+    "⭐ Key Points": "keypoints",
+    "📸 Images": "images",
+}
 
-def _get_page_count(file_path: str) -> int:
-    """Quick page count using pypdf (no full parse needed)."""
+
+def _process(file_path: str, pdf_hash: str) -> None:
+    """Parse, describe images, embed and index - with one progress bar."""
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    def update(fraction: float, message: str) -> None:
+        progress_bar.progress(min(1.0, fraction))
+        status_text.caption(message)
+
+    chunks = process_pdf(file_path, progress_callback=lambda p, m: update(0.85 * p, m))
     try:
-        return len(PdfReader(file_path).pages)
+        index_chunks(pdf_hash, chunks, progress_callback=lambda p, m: update(0.85 + 0.15 * p, m))
     except Exception:
-        return 0
+        delete_collection(pdf_hash)
+        raise
+    update(1.0, "Complete!")
+
+
+@st.fragment(run_every=5)
+def _image_status(pdf_hash: str) -> None:
+    """Live status of the background diagram descriptions."""
+    progress = description_progress(pdf_hash)
+    if progress:
+        done, total = progress
+        st.caption(f"🖼️ Making diagrams searchable in the background: {done}/{total}")
 
 
 def render_sidebar() -> dict:
     """
-    Renders the sidebar and handles PDF upload + processing.
+    Renders the sidebar with upload, processing, and navigation.
 
     Returns state dict:
-    {
-        "pdf_hash": str | None,
-        "pdf_name": str | None,
-        "is_ready": bool,
-    }
+    {"pdf_hash": str | None, "pdf_name": str | None, "is_ready": bool, "view": str}
     """
-    state = {"pdf_hash": None, "pdf_name": None, "is_ready": False}
+    state = {"pdf_hash": None, "pdf_name": None, "is_ready": False, "view": "chat"}
 
     with st.sidebar:
-        st.title("📄 AwarePDF")
-        st.caption("Upload your textbook and start learning smarter")
+        st.markdown("### 📄 AwarePDF")
+        st.caption("AI-powered textbook assistant")
 
-        readiness = initialize_vector_store(warmup_embeddings=False)
-        if not readiness["ready"]:
-            st.error(f"⚠️ Vector DB init failed: {readiness.get('error', 'unknown error')}")
-            return state
+        if not validate_keys()["groq"]:
+            st.error("⚠️ GROQ_API_KEY not set in .env — get a free key at console.groq.com")
 
-        # --- API KEY WARNINGS ---
-        keys = validate_keys()
-        if not keys["groq"]:
-            st.error("⚠️ GROQ_API_KEY not set in .env")
-        if not keys["google"]:
-            st.warning("💡 GOOGLE_API_KEY not set — summaries will use Groq, image descriptions disabled")
-
-        st.divider()
-
-        # --- FILE UPLOAD ---
+        st.markdown("---")
+        st.markdown("#### 📤 Upload Document")
         uploaded_file = st.file_uploader(
-            "Upload PDF",
+            "Choose a PDF file",
             type=["pdf"],
-            help=f"Max size: {MAX_UPLOAD_SIZE_MB}MB. Large textbooks (600+ pages) may take 5-15 min to process.",
+            help=f"Max size: {MAX_UPLOAD_SIZE_MB}MB",
+            label_visibility="collapsed",
         )
 
         if uploaded_file is None:
-            st.info("👆 Upload a PDF to get started")
+            for key in ("current_pdf_id", "current_pdf_hash", "current_pdf_path"):
+                st.session_state.pop(key, None)
+            st.info("👆 Upload a PDF to begin")
             return state
 
-        # --- SIZE CHECK ---
-        file_size = len(uploaded_file.getbuffer()) / (1024 * 1024)
+        file_size = uploaded_file.size / (1024 * 1024)
         if file_size > MAX_UPLOAD_SIZE_MB:
-            st.error(f"File too large ({file_size:.1f}MB). Max: {MAX_UPLOAD_SIZE_MB}MB")
+            st.error(f"File too large ({file_size:.1f}MB)")
             return state
 
-        st.success(f"✅ {uploaded_file.name} ({file_size:.1f}MB)")
-
-        # --- SAVE + HASH ---
-        file_path = save_uploaded_file(uploaded_file)
-        pdf_hash = get_pdf_hash(file_path)
+        # --- SAVE + HASH (once per uploaded file) ---
+        if st.session_state.get("current_pdf_id") != uploaded_file.file_id:
+            file_path = save_uploaded_file(uploaded_file)
+            st.session_state["current_pdf_id"] = uploaded_file.file_id
+            st.session_state["current_pdf_hash"] = get_pdf_hash(file_path)
+            st.session_state["current_pdf_path"] = file_path
+        pdf_hash = st.session_state["current_pdf_hash"]
+        file_path = st.session_state["current_pdf_path"]
 
         state["pdf_hash"] = pdf_hash
         state["pdf_name"] = uploaded_file.name
+        st.success(f"✅ {uploaded_file.name}")
 
-        # --- ALREADY PROCESSED? ---
-        if collection_exists(pdf_hash):
-            stats = get_collection_stats(pdf_hash)
-            chunk_count = stats.get("chunk_count", stats.get("count", 0))
-            st.success(f"✅ Already indexed ({chunk_count} chunks)")
-            state["is_ready"] = True
-            return state
+        # --- PROCESS ONCE ---
+        if not is_indexed(pdf_hash):
+            try:
+                page_count = get_page_count(file_path)
+            except Exception as exc:
+                st.error(f"❌ {exc}")
+                return state
 
-        # --- SHOW PAGE COUNT + TIME ESTIMATE ---
-        page_count = _get_page_count(file_path)
-        if page_count > 0:
-            est_minutes = max(1, round(page_count / 60))
             st.info(
-                f"📖 {page_count} pages detected. "
-                f"Estimated processing time: ~{est_minutes} min. "
-                "Processing happens once — results are cached."
+                f"📖 {page_count} pages · {file_size:.1f}MB\n\n"
+                f"⏱️ Est. time: ~{max(1, round(page_count / 60))}-{max(2, round(page_count / 30))} min "
+                "(one time only)"
             )
+            try:
+                _process(file_path, pdf_hash)
+            except Exception as exc:
+                logger.exception("Processing failed for %s", uploaded_file.name)
+                st.error(f"❌ Processing failed:\n\n{exc}")
+                return state
+            st.rerun()
 
-        # --- PROCESS PDF ---
-        st.info("🔄 Processing PDF... (first time only, results cached)")
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
-
-        def update_progress(percent: float, message: str):
-            progress_bar.progress(float(percent))
-            status_text.text(message)
-
-        try:
-            # Step 1: Parse + chunk + extract images
-            final_chunks = process_pdf(file_path, progress_callback=update_progress)
-
-            # Step 2: Store in ChromaDB
-            update_progress(0.92, "Storing in vector database...")
-            collection = create_or_get_collection(pdf_hash)
-            add_documents(collection, final_chunks)
-
-            update_progress(1.0, "Done!")
-            progress_bar.progress(1.0)
-
-            text_chunks = sum(1 for c in final_chunks if c.get("content_type") != "image_description")
-            img_chunks = len(final_chunks) - text_chunks
-            st.success(
-                f"✅ Indexed {len(final_chunks)} chunks "
-                f"({text_chunks} text, {img_chunks} image descriptions)"
+        if images_pending(pdf_hash):
+            start_background_description(
+                pdf_hash,
+                on_batch=lambda chunks: add_image_chunks(pdf_hash, chunks),
+                on_finished=lambda: mark_images_done(pdf_hash),
             )
-            state["is_ready"] = True
+        st.caption(f"Indexed: {get_chunk_count(pdf_hash)} chunks")
+        _image_status(pdf_hash)
+        state["is_ready"] = True
 
-        except Exception as exc:
-            st.error(f"❌ Processing failed: {exc}")
-            logger.exception("Processing failed for %s", uploaded_file.name)
-
+        # --- NAVIGATION ---
+        st.markdown("---")
+        st.markdown("#### 🧭 Features")
+        choice = st.radio("Feature", list(VIEWS), label_visibility="collapsed")
+        state["view"] = VIEWS[choice]
         return state

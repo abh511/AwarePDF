@@ -1,73 +1,166 @@
-# ============================================================
-# app/core/chunker.py
-# Splits extracted text into chunks for embedding
-#
-# WHY CHUNKING MATTERS:
-# - Too small (< 100 chars): loses context, retrieval gets fragments
-# - Too large (> 1000 chars): dilutes the relevant part, wastes tokens
-# - 1000 chars with 200 overlap is the sweet spot for textbooks
-#
-# We use RecursiveCharacterTextSplitter because it tries to split
-# on paragraphs first, then sentences, then words - preserving meaning.
-# ============================================================
+"""Section-aware chunking for long textbooks.
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+Docling yields one element per paragraph/list item, which is far too small for
+good retrieval (a 700-page book produces 10k+ fragments of ~100 chars).
+This module:
+- Merges consecutive paragraphs of the same section up to CHUNK_SIZE chars
+- Splits only oversized paragraphs, at sentence boundaries, with overlap
+- Splits huge tables by rows, repeating the header row in every part
+- Keeps headings as separate chunks (used for the outline, excluded from search)
+- Never drops text
+"""
+
+import re
+
 from app.utils.logger import get_logger
 from config.settings import CHUNK_SIZE, CHUNK_OVERLAP
 
 logger = get_logger(__name__)
 
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 
-def chunk_with_metadata(raw_chunks: list[dict]) -> list[dict]:
-    """
-    Takes raw chunks from pdf_processor and splits long ones further.
-    Tables, headings, and figure captions are NOT split - kept whole.
 
-    Returns list of final chunks ready for embedding.
+def _hard_split(text: str, size: int) -> list[str]:
+    """Split text with no sentence boundaries at word boundaries."""
+    pieces: list[str] = []
+    current = ""
+    for word in text.split(" "):
+        if current and len(current) + 1 + len(word) > size:
+            pieces.append(current)
+            current = word
+        else:
+            current = f"{current} {word}" if current else word
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split long text into pieces of at most ~size chars, at sentence boundaries."""
+    if len(text) <= size:
+        return [text]
+
+    sentences: list[str] = []
+    for sentence in _SENTENCE_END_RE.split(text):
+        sentences.extend(_hard_split(sentence, size) if len(sentence) > size else [sentence])
+
+    pieces: list[str] = []
+    current: list[str] = []
+    length = 0
+    for sentence in sentences:
+        if current and length + len(sentence) + 1 > size:
+            pieces.append(" ".join(current))
+            # Carry trailing sentences into the next piece as overlap
+            carried: list[str] = []
+            carried_len = 0
+            for prev in reversed(current):
+                if carried_len + len(prev) > overlap:
+                    break
+                carried.insert(0, prev)
+                carried_len += len(prev) + 1
+            current, length = carried, carried_len
+        current.append(sentence)
+        length += len(sentence) + 1
+    if current:
+        pieces.append(" ".join(current))
+    return pieces
+
+
+def split_table(markdown: str, size: int = CHUNK_SIZE) -> list[str]:
+    """Split a markdown table into row groups, repeating the header in each part."""
+    if len(markdown) <= size * 2:
+        return [markdown]
+    lines = markdown.splitlines()
+    header, rows = lines[:2], lines[2:]
+    header_len = sum(len(line) + 1 for line in header)
+    parts: list[str] = []
+    current: list[str] = []
+    length = header_len
+    for row in rows:
+        if current and length + len(row) + 1 > size * 2:
+            parts.append("\n".join(header + current))
+            current, length = [], header_len
+        current.append(row)
+        length += len(row) + 1
+    if current:
+        parts.append("\n".join(header + current))
+    return parts
+
+
+def chunk_elements(elements: list[dict]) -> list[dict]:
     """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
-        length_function=len,
+    Turn reading-order elements into retrieval chunks.
+
+    Each element: {"text", "page_number", "content_type" (text|heading|table), "section"}
+    Each chunk adds "page_end" (last page it spans) and "chunk_index".
+    """
+    chunks: list[dict] = []
+    buffer: list[str] = []
+    buffer_len = 0
+    buffer_section = ""
+    buffer_pages = (0, 0)
+
+    def add(text: str, content_type: str, section: str, page: int, page_end: int) -> None:
+        chunks.append({
+            "text": text,
+            "page_number": page,
+            "page_end": page_end,
+            "content_type": content_type,
+            "section": section,
+            "chunk_index": len(chunks),
+        })
+
+    def flush() -> None:
+        nonlocal buffer, buffer_len
+        if buffer:
+            add("\n".join(buffer), "text", buffer_section, *buffer_pages)
+        buffer, buffer_len = [], 0
+
+    for element in elements:
+        text = (element.get("text") or "").strip()
+        if not text:
+            continue
+        content_type = element.get("content_type", "text")
+        section = element.get("section", "")
+        page = int(element.get("page_number") or 0)
+
+        if content_type == "heading":
+            flush()
+            add(text, "heading", section, page, page)
+            continue
+
+        if content_type == "table":
+            flush()
+            for part in split_table(text):
+                add(part, "table", section, page, page)
+            continue
+
+        if buffer and section != buffer_section:
+            flush()
+
+        if len(text) > CHUNK_SIZE:
+            flush()
+            for piece in split_text(text):
+                add(piece, "text", section, page, page)
+            continue
+
+        if buffer and buffer_len + len(text) + 1 > CHUNK_SIZE:
+            flush()
+        if not buffer:
+            buffer_section = section
+            buffer_pages = (page, page)
+        buffer.append(text)
+        buffer_len += len(text) + 1
+        buffer_pages = (buffer_pages[0], max(buffer_pages[1], page))
+
+    flush()
+
+    text_chunks = [c for c in chunks if c["content_type"] != "heading"]
+    logger.info(
+        "Chunking: %s elements → %s chunks (%s headings, avg %s chars)",
+        len(elements),
+        len(chunks),
+        len(chunks) - len(text_chunks),
+        sum(len(c["text"]) for c in text_chunks) // max(1, len(text_chunks)),
     )
-
-    final_chunks = []
-    sub_chunk_counter = 0  # global counter to ensure unique integer chunk_index
-
-    for raw_chunk in raw_chunks:
-        content_type = raw_chunk.get("content_type", "text")
-
-        # Tables, headings, captions and image descriptions stay whole
-        if content_type in ("table", "heading", "figure_caption", "image_description"):
-            new_chunk = raw_chunk.copy()
-            new_chunk["chunk_index"] = sub_chunk_counter
-            sub_chunk_counter += 1
-            final_chunks.append(new_chunk)
-            continue
-
-        text = raw_chunk.get("text", "")
-        if not text.strip():
-            continue
-
-        # Short enough - no split needed
-        if len(text) <= CHUNK_SIZE:
-            new_chunk = raw_chunk.copy()
-            new_chunk["chunk_index"] = sub_chunk_counter
-            sub_chunk_counter += 1
-            final_chunks.append(new_chunk)
-            continue
-
-        # Split long text chunks - chunk_index stays int (required by ChromaDB)
-        sub_texts = splitter.split_text(text)
-        for sub_text in sub_texts:
-            if not sub_text.strip():
-                continue
-            new_chunk = raw_chunk.copy()
-            new_chunk["text"] = sub_text
-            new_chunk["chunk_index"] = sub_chunk_counter
-            sub_chunk_counter += 1
-            final_chunks.append(new_chunk)
-
-    logger.info("Chunking: %s raw → %s final chunks", len(raw_chunks), len(final_chunks))
-    return final_chunks
+    return chunks

@@ -1,35 +1,22 @@
-# Core App
-streamlit
+# App
+streamlit>=1.45
 python-dotenv
 Pillow
-
-# LLM / LangChain
-langchain
-langchain-text-splitters
-langchain-community
-langchain-groq
-tiktoken
-
-# Vector Database
-chromadb
-
-# Embeddings
-sentence-transformers
-transformers
-torch
-
-# Document Processing
-pypdf
-docling
-PyMuPDF  # provides the `fitz` module for image extraction
-
-# LLM APIs
-groq
-google-generativeai
-
-# Utilities
-tenacity
 rich
+
+# LLM API (free tier, open-weight models)
+groq
+
+# PDF parsing
+docling
+PyMuPDF
+
+# Retrieval
+chromadb>=1.0
+sentence-transformers>=3.0
+torch
+rank-bm25
+numpy
 
 # Testing
 pytest

@@ -1,94 +1,69 @@
 # ============================================================
 # app/ui/chat.py
-# Chat interface for Q&A with image support
+# Chat interface with page citations and referenced diagrams
 # ============================================================
 
-import streamlit as st
 from pathlib import Path
+
+import streamlit as st
+
 from app.features.qa import answer_question
 
 
-def _chat_key(pdf_hash: str) -> str:
-    """Per-PDF session key so switching PDFs clears the chat."""
-    return f"messages_{pdf_hash}"
+def _page_label(src: dict) -> str:
+    if src.get("page_end") and src["page_end"] != src["page"]:
+        return f"Pages {src['page']}-{src['page_end']}"
+    return f"Page {src['page']}"
+
+
+def _render_extras(sources: list[dict]) -> None:
+    """Show diagrams used for the answer, then the sources."""
+    for src in sources:
+        if src.get("image_path") and Path(src["image_path"]).exists():
+            st.image(src["image_path"], caption=f"📄 Page {src['page']}", width=400)
+
+    if sources:
+        with st.expander("📚 View Sources"):
+            for idx, src in enumerate(sources, 1):
+                st.markdown(f"**Source {idx}** - {_page_label(src)}")
+                if src.get("section"):
+                    st.caption(f"Section: {src['section']}")
+                if src.get("content_type") == "image_description":
+                    st.caption("🖼️ From diagram/image")
+                st.text(src["preview"])
+                st.markdown("---")
 
 
 def render_chat(pdf_hash: str, pdf_name: str):
-    """Renders the Q&A chat interface with image display support."""
+    """Renders the Q&A chat interface."""
+    st.markdown("### 💬 Ask Questions")
+    st.caption("Get accurate answers with page citations")
 
-    st.subheader("💬 Ask Questions")
-    st.caption(f"Asking about: **{pdf_name}**")
+    chat_key = f"messages_{pdf_hash}"
+    messages = st.session_state.setdefault(chat_key, [])
 
-    chat_key = _chat_key(pdf_hash)
-
-    # Initialize per-PDF chat history
-    if chat_key not in st.session_state:
-        st.session_state[chat_key] = []
-
-    messages = st.session_state[chat_key]
-
-    # Display existing messages
     for msg in messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            _render_extras(msg.get("sources", []))
 
-            # Show referenced images if any
-            if msg.get("images"):
-                for img in msg["images"]:
-                    img_path = Path(img["path"])
-                    if img_path.exists():
-                        st.image(str(img_path), caption=f"📄 Page {img['page']}", width=300)
-
-            if msg.get("sources"):
-                with st.expander("📚 Sources"):
-                    for src in msg["sources"]:
-                        st.caption(f"📄 Page {src['page']} | {src['section']}")
-                        if src.get("content_type") == "image_description":
-                            st.caption("🖼️ *From diagram/image analysis*")
-                        st.text(src["preview"])
-
-    # Chat input
     if question := st.chat_input("Ask anything about your PDF..."):
-        messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                result = answer_question(pdf_hash, question)
-
+            try:
+                with st.spinner("Thinking..."):
+                    result = answer_question(pdf_hash, question, chat_history=messages)
+            except Exception as exc:
+                st.error(f"❌ {exc}")
+                return
             st.markdown(result["answer"])
+            _render_extras(result["sources"])
 
-            # Display referenced images inline
-            referenced_images = []
-            if result["sources"]:
-                for src in result["sources"]:
-                    if src.get("content_type") == "image_description" and src.get("image_path"):
-                        img_path = Path(src["image_path"])
-                        if img_path.exists():
-                            st.image(
-                                str(img_path),
-                                caption=f"📄 Referenced diagram (Page {src['page']})",
-                                width=400,
-                            )
-                            referenced_images.append({"path": src["image_path"], "page": src["page"]})
+        messages.append({"role": "user", "content": question})
+        messages.append({"role": "assistant", "content": result["answer"], "sources": result["sources"]})
 
-                with st.expander("📚 Sources used"):
-                    for src in result["sources"]:
-                        st.caption(f"📄 Page {src['page']} | {src['section']}")
-                        if src.get("content_type") == "image_description":
-                            st.caption("🖼️ *From diagram/image analysis*")
-                        st.text(src["preview"])
-
-        messages.append({
-            "role": "assistant",
-            "content": result["answer"],
-            "sources": result["sources"],
-            "images": referenced_images,
-        })
-
-    # Clear chat button
-    if messages:
-        if st.button("🗑️ Clear Chat"):
-            st.session_state[chat_key] = []
-            st.rerun()
+    if messages and st.button("🗑️ Clear Chat History", width="stretch"):
+        st.session_state[chat_key] = []
+        st.rerun()

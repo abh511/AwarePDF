@@ -1,44 +1,35 @@
 # ============================================================
 # app/features/summarizer.py
-# Summarization - uses Gemini for large context
+# Summarization
+# - Whole book: evenly spaced sample across all pages, so the
+#   summary covers every chapter instead of the first few
+# - Focused: retrieval on a chapter/topic for a detailed summary
 # ============================================================
 
-from app.core.retriever import retrieve_for_summary
-from app.core.llm import call_gemini, call_groq, format_context, SUMMARY_PROMPT_TEMPLATE
+from app.core.retriever import chunks_for_topic, sample_across_document
+from app.core.llm import call_llm, format_context, SUMMARY_SYSTEM_PROMPT, SUMMARY_USER_TEMPLATE
 from app.utils.logger import get_logger
-from config.settings import GOOGLE_API_KEY
+from config.settings import LLM_MAX_PROMPT_CHARS
 
 logger = get_logger(__name__)
 
 
-def summarize_pdf(pdf_hash: str) -> str:
-    """
-    Generates a comprehensive summary of the entire PDF.
-
-    Strategy:
-    - Collect a broad spread of chunks (headings + key content)
-    - Send ALL of them to Gemini (large context window)
-    - Gemini synthesizes a proper summary
-
-    Falls back to Groq if Gemini key not set.
-    """
-    chunks = retrieve_for_summary(pdf_hash, max_chunks=40)
+def summarize_pdf(pdf_hash: str, focus: str | None = None) -> str:
+    """Summarize the whole document, or only the part about `focus`."""
+    budget = LLM_MAX_PROMPT_CHARS - 1500
+    if focus:
+        chunks = chunks_for_topic(pdf_hash, focus, max_chars=budget)
+        scope = f"Focus only on: {focus}\n"
+    else:
+        chunks = sample_across_document(pdf_hash, max_chars=budget)
+        scope = "The content is a sample spread evenly across the whole book; cover every major part.\n"
 
     if not chunks:
         return "Could not retrieve content for summarization."
 
-    context = format_context(chunks)
-    prompt = SUMMARY_PROMPT_TEMPLATE.format(context=context)
-
-    # Use Gemini if available (better for large context)
-    if GOOGLE_API_KEY:
-        logger.info("Using Gemini for summarization")
-        return call_gemini(prompt, temperature=0.4, max_tokens=2000)
-    else:
-        logger.info("Gemini key not set, using Groq for summarization")
-        return call_groq(
-            system_prompt="You are an expert academic summarizer.",
-            user_prompt=prompt,
-            temperature=0.4,
-            max_tokens=1500,
-        )
+    return call_llm(
+        system_prompt=SUMMARY_SYSTEM_PROMPT,
+        user_prompt=SUMMARY_USER_TEMPLATE.format(scope=scope, context=format_context(chunks, max_chars=budget)),
+        temperature=0.4,
+        max_tokens=2500,
+    )

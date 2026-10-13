@@ -1,79 +1,108 @@
 # ============================================================
 # app/core/llm.py
-# LLM clients and prompt templates
+# Groq client (free API serving open-weight models) and prompt templates
 #
-# TWO LLM STRATEGY:
-# - Groq (Llama 3.3 70b): Q&A, key points, topics - fast, free
-# - Gemini 1.5 Flash: Summarization - handles huge context (1M tokens)
+# - LLM_MODEL (gpt-oss-120b): Q&A, summaries, topics, key points
+# - VISION_MODEL (Qwen): describes diagrams/figures during ingestion
 #
-# WHY GEMINI FOR SUMMARIES?
-# Summarizing a whole textbook chapter needs to see ALL the content.
-# RAG retrieval gives you fragments - bad for summaries.
-# Gemini's 1M token context window can take 50-100 chunks at once.
+# Rate limits (HTTP 429) and server errors are retried by the Groq SDK,
+# which honours the retry-after header sent by the API.
 # ============================================================
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+import base64
+import re
+
 from app.utils.logger import get_logger
-from config.settings import GROQ_API_KEY, GOOGLE_API_KEY, GROQ_MODEL, GEMINI_MODEL
+from config.settings import (
+    GROQ_API_KEY, LLM_MODEL, VISION_MODEL, LLM_REASONING_EFFORT, LLM_MAX_PROMPT_CHARS,
+)
 
 logger = get_logger(__name__)
 
+_groq_client = None
 
-# ============================================================
-# GROQ CLIENT
-# ============================================================
+# Some open models emit their chain of thought inline; never show it to the user
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+class LLMError(Exception):
+    """Raised when the LLM API is not configured or the request fails."""
+
 
 def get_groq_client():
-    from groq import Groq
-    return Groq(api_key=GROQ_API_KEY)
+    """Return a cached Groq client instance."""
+    global _groq_client
+    if not GROQ_API_KEY:
+        raise LLMError("GROQ_API_KEY is not set. Get a free key at https://console.groq.com")
+    if _groq_client is None:
+        from groq import Groq
+        _groq_client = Groq(api_key=GROQ_API_KEY, max_retries=5, timeout=120)
+    return _groq_client
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-def call_groq(
+def _complete(model: str, messages: list[dict], temperature: float, max_tokens: int, **extra) -> str:
+    try:
+        response = get_groq_client().chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **extra,
+        )
+    except LLMError:
+        raise
+    except Exception as exc:
+        raise LLMError(f"LLM request to '{model}' failed: {exc}") from exc
+    content = response.choices[0].message.content or ""
+    return _THINK_RE.sub("", content).strip()
+
+
+def call_llm(
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.3,
-    max_tokens: int = 4096,  # Increased from 2500 - llama-3.3-70b supports up to 32768
+    max_tokens: int = 2048,
+    reasoning_effort: str | None = None,
 ) -> str:
     """
-    Calls Groq API with retry logic.
+    Calls the text LLM.
     Low temperature = more factual (good for engineering Q&A).
+    Truncates prompts above LLM_MAX_PROMPT_CHARS to stay inside free-tier limits.
     """
-    client = get_groq_client()
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
+    if len(user_prompt) > LLM_MAX_PROMPT_CHARS:
+        logger.warning("User prompt too long (%s chars), truncating to %s",
+                       len(user_prompt), LLM_MAX_PROMPT_CHARS)
+        user_prompt = user_prompt[:LLM_MAX_PROMPT_CHARS] + "\n\n[Content truncated due to length...]"
+
+    effort = reasoning_effort if reasoning_effort is not None else LLM_REASONING_EFFORT
+    extra = {"reasoning_effort": effort} if effort else {}
+    return _complete(
+        LLM_MODEL,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=temperature,
+        temperature,
+        max_tokens,
+        **extra,
+    )
+
+
+def describe_image(jpeg_bytes: bytes, prompt: str, max_tokens: int = 600) -> str:
+    """Calls the vision LLM with a single JPEG image."""
+    data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg_bytes).decode("ascii")
+    return _complete(
+        VISION_MODEL,
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
+        temperature=0.2,
         max_tokens=max_tokens,
     )
-    return response.choices[0].message.content.strip()
-
-
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-def call_gemini(
-    prompt: str,
-    temperature: float = 0.4,
-    max_tokens: int = 3000,
-) -> str:
-    """Calls Gemini API. Used for summarization with large context."""
-    import google.generativeai as genai
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        ),
-    )
-    return response.text.strip()
 
 
 # ============================================================
@@ -91,15 +120,17 @@ RULES:
 - Be clear and educational - explain like a knowledgeable tutor
 - For technical concepts, give a brief definition before elaborating
 - For mathematical formulas and equations, write them clearly with proper notation
-- For diagrams and figures referenced in the context, describe what they show
-- If image descriptions are provided in the context, use them to enhance your answer
+- If image/diagram descriptions are provided in the context, use them to enhance your answer
 - For engineering problems, show step-by-step solutions when relevant
 - Include units and dimensional analysis where applicable
-- Do NOT make up information not present in the context"""
+- Do NOT make up information not present in the context
+- Do NOT invent your own examples unless the student asks for one; use the book's examples instead
+- If the student asks for an example the book lacks, label it "Example (not from the book)" and recheck every bit, digit and calculation in it before answering
+- For questions about the book's structure (chapters, topics, contents), use the book outline when provided"""
 
-QA_USER_TEMPLATE = """Context from the textbook:
+QA_USER_TEMPLATE = """{outline}Context from the textbook:
 {context}
-
+{history}
 Student's question: {question}
 
 Answer the question clearly and thoroughly, citing page numbers where available. If the context includes image/diagram descriptions, reference them in your answer. For numerical or formula-based questions, show the relevant equations and steps."""
@@ -119,39 +150,41 @@ KEY_POINTS_USER_TEMPLATE = """Extract the most important key points from this te
 Content:
 {context}
 
-Format your response as a numbered list of clear, concise key points.
+Format your response as a numbered list of clear, concise key points, each ending with its page citation like (Page 12).
 Focus on: definitions, formulas, important concepts, rules, warnings, and diagram descriptions.
-Maximum 15 points. For formulas, write them out clearly."""
+Maximum 15 points. For formulas, write them out clearly.
+Use ONLY facts and formulas that appear in the content; never invent any."""
 
 
 TOPICS_SYSTEM_PROMPT = """You are an expert at analyzing academic engineering and science documents and identifying their structure."""
 
-TOPICS_USER_TEMPLATE = """Based on the following content from a textbook, identify the main topics and subtopics covered.
+TOPICS_USER_TEMPLATE = """Below are the section headings of a textbook in reading order, each with its page number.
 
-Content (section headings and key chunks):
 {context}
 
-Output a structured topic list like:
-1. Main Topic
-   - Subtopic
-   - Subtopic
-2. Main Topic
+Organize them into a clean structured outline of main topics (chapters) and subtopics:
+1. Main Topic (Page X)
+   - Subtopic (Page Y)
+   - Subtopic (Page Z)
+2. Main Topic (Page X)
    ...
 
-Only include topics clearly present in the content."""
+Merge duplicates, drop noise (running headers, exercise numbers, index entries), and only include topics present in the list."""
 
 
-SUMMARY_PROMPT_TEMPLATE = """You are an expert academic summarizer specializing in engineering and technical content.
+SUMMARY_SYSTEM_PROMPT = """You are an expert academic summarizer specializing in engineering and technical content."""
 
-Summarize the following textbook content clearly and comprehensively.
+SUMMARY_USER_TEMPLATE = """Summarize the following textbook content clearly and comprehensively.
+{scope}
 The summary should:
-- Cover all major topics mentioned
 - Be organized with clear sections using headers
 - Highlight key concepts, formulas, and definitions
 - Note any diagrams, figures, or visual content described in the text
 - Include important equations in proper notation
+- Cite page numbers for the main points, like (Page 12)
 - Be useful for exam preparation
-- Be approximately 400-600 words
+- Be approximately 400-700 words
+- Use ONLY facts, formulas and page numbers that appear in the content below; never invent formulas, terms or examples
 
 Textbook content:
 {context}
@@ -159,32 +192,37 @@ Textbook content:
 Write the summary now:"""
 
 
-def format_context(chunks: list[dict]) -> str:
+def _page_label(meta: dict) -> str:
+    page = meta.get("page_number") or "?"
+    page_end = meta.get("page_end")
+    if page_end and page_end != page:
+        return f"Pages {page}-{page_end}"
+    return f"Page {page}"
+
+
+def format_context(chunks: list[dict], max_chars: int | None = None) -> str:
     """
     Formats retrieved chunks into a single context string for the LLM.
-    Handles both flat chunks (from pdf_processor) and nested metadata
-    (from similarity_search results).
+    Stops adding chunks once max_chars would be exceeded.
     """
-    parts = []
+    type_labels = {
+        "image_description": "[IMAGE/DIAGRAM DESCRIPTION] ",
+        "table": "[TABLE] ",
+    }
+    parts: list[str] = []
+    total = 0
     for chunk in chunks:
-        # similarity_search returns metadata nested under "metadata" key
+        text = chunk.get("text", "")
+        if not text.strip():
+            continue
         meta = chunk.get("metadata") or {}
-        page = meta.get("page_number") or chunk.get("page_number", "?")
-        section = meta.get("section") or chunk.get("section", "")
-        content_type = meta.get("content_type") or chunk.get("content_type", "text")
-
-        if content_type == "image_description":
-            type_label = "[IMAGE/DIAGRAM DESCRIPTION] "
-        elif content_type == "table":
-            type_label = "[TABLE] "
-        elif content_type == "figure_caption":
-            type_label = "[FIGURE CAPTION] "
-        elif content_type == "heading":
-            type_label = "[HEADING] "
-        else:
-            type_label = ""
-
+        section = meta.get("section", "")
         section_label = f" | Section: {section}" if section else ""
-        parts.append(f"[Page {page}{section_label}]\n{type_label}{chunk['text']}")
+        type_label = type_labels.get(meta.get("content_type", "text"), "")
+        part = f"[{_page_label(meta)}{section_label}]\n{type_label}{text}"
+        if max_chars is not None and parts and total + len(part) > max_chars:
+            break
+        parts.append(part)
+        total += len(part) + 7
 
     return "\n\n---\n\n".join(parts)

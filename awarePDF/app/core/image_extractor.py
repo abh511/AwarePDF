@@ -1,33 +1,54 @@
 # ============================================================
 # app/core/image_extractor.py
 # Extracts images/diagrams from PDF pages using PyMuPDF (fitz)
-# and generates text descriptions using Gemini Vision API.
+# and generates text descriptions with an open-weight vision model.
 #
 # WHY MULTIMODAL?
 # Engineering textbooks are full of diagrams, flowcharts, circuit
-# diagrams, color-coded boxes, and figures. A text-only RAG system
-# misses all of this. By extracting images, describing them with
-# a vision LLM, and storing those descriptions as searchable chunks,
-# we can answer questions about visual content too.
+# diagrams and figures. A text-only RAG system misses all of this.
+# Descriptions become searchable chunks; the images are shown in the UI.
 #
 # PIPELINE:
-# 1. PyMuPDF extracts all images from every page
-# 2. Filter out tiny icons/decorations (< MIN_IMAGE_SIZE bytes)
-# 3. Gemini Vision describes each significant image (with rate-limit handling)
-# 4. Descriptions become chunks in ChromaDB (searchable)
-# 5. Original images saved to disk for UI display
+# 1. During processing, PyMuPDF saves every significant image (fast)
+# 2. After the text is indexed, a background thread describes the
+#    largest MAX_IMAGES_TO_DESCRIBE images one at a time, paced by the
+#    API rate limit, and adds each batch to the index as it goes.
+#    The book is usable immediately; diagrams become searchable gradually.
+# 3. Descriptions are cached per image, so a restart resumes the work.
 # ============================================================
 
-import logging
-import time
+import io
+import json
+import threading
 from pathlib import Path
 from typing import Callable
 
 import config.settings as settings
+from app.core import llm
+from app.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-ProgressCallback = Callable[[float, str], None]
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+_MANIFEST_FILE = "images.json"
+_DESCRIPTIONS_FILE = "descriptions.json"
+_DECORATIVE = "DECORATIVE"
+
+_PROMPT = (
+    "You are analyzing an image from an engineering/technical textbook (page {page}). "
+    "Describe it for a student studying this material. "
+    "Diagram: explain what it shows and name the labelled components. "
+    "Graph/chart: describe the axes, trends, and key values. "
+    "Circuit/flowchart: describe the flow and connections. "
+    "Formula: write it out in text. Note/warning/definition box: transcribe it. "
+    "If it is purely decorative (logo, photo of a person, cover art), reply only with: DECORATIVE. "
+    "Be technical and concise: under 200 words."
+)
+
+# pdf_hash -> background worker / (described, total) progress
+_workers: dict[str, threading.Thread] = {}
+_progress: dict[str, tuple[int, int]] = {}
+_workers_lock = threading.Lock()
 
 
 def _get_image_dir(pdf_hash: str) -> Path:
@@ -37,258 +58,210 @@ def _get_image_dir(pdf_hash: str) -> Path:
     return img_dir
 
 
-def _extract_images_from_pdf(pdf_path: str, pdf_hash: str) -> list[dict]:
-    """
-    Extract all significant images from a PDF using PyMuPDF.
-
-    Returns list of dicts with image_path, page_number, image_index,
-    width, height, image_bytes, ext.
-    """
+def _read_json(path: Path, default):
     try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        logger.warning(
-            "PyMuPDF (fitz) not installed. Install with: pip install PyMuPDF. "
-            "Skipping image extraction."
-        )
-        return []
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+def extract_images(pdf_path: str, pdf_hash: str) -> list[dict]:
+    """
+    Save every significant image in the PDF to disk and write a manifest.
+
+    Returns list of dicts with image_path, page_number, width, height.
+    """
+    import fitz  # PyMuPDF
 
     img_dir = _get_image_dir(pdf_hash)
-    extracted = []
-    min_size = settings.MIN_IMAGE_SIZE
+    extracted: list[dict] = []
+    seen_xrefs: set[int] = set()
 
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception:
-        logger.exception("Failed to open PDF for image extraction: %s", pdf_path)
-        return []
+    with fitz.open(pdf_path) as doc:
+        for page_index in range(doc.page_count):
+            page = doc[page_index]
+            page_number = page_index + 1
+            for img_idx, img_info in enumerate(page.get_images(full=True)):
+                xref, width, height = img_info[0], img_info[2], img_info[3]
+                # The same xref on many pages is a logo/header graphic
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
 
-    try:
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            try:
-                image_list = page.get_images(full=True)
-            except Exception:
-                logger.debug("Could not get images from page %s", page_num + 1)
-                continue
+                if min(width, height) < settings.MIN_IMAGE_DIM:
+                    continue
+                if max(width, height) / max(1, min(width, height)) > 8:
+                    continue  # horizontal/vertical rules and borders
 
-            for img_idx, img_info in enumerate(image_list):
-                xref = img_info[0]
                 try:
                     base_image = doc.extract_image(xref)
                 except Exception:
-                    logger.debug("Could not extract image xref %s on page %s", xref, page_num + 1)
+                    logger.debug("Could not extract image xref %s on page %s", xref, page_number)
+                    continue
+                if not base_image or len(base_image.get("image", b"")) < settings.MIN_IMAGE_BYTES:
                     continue
 
-                if not base_image:
-                    continue
-
-                image_bytes = base_image.get("image", b"")
-                ext = base_image.get("ext", "png")
-                width = base_image.get("width", 0)
-                height = base_image.get("height", 0)
-
-                # Skip tiny images (icons, bullets, decorations)
-                if len(image_bytes) < min_size:
-                    continue
-                if width < 50 or height < 50:
-                    continue
-
-                img_filename = f"page_{page_num + 1}_img_{img_idx}.{ext}"
-                img_path = img_dir / img_filename
-
+                ext = base_image.get("ext", "png").lower()
+                stem = f"page_{page_number}_img_{img_idx}"
                 try:
-                    img_path.write_bytes(image_bytes)
+                    if ext in ("png", "jpg", "jpeg"):
+                        img_path = img_dir / f"{stem}.{ext}"
+                        img_path.write_bytes(base_image["image"])
+                    else:
+                        # JPX/JBIG2/CMYK etc. are not browser-friendly: convert to PNG
+                        pix = fitz.Pixmap(doc, xref)
+                        if pix.n - pix.alpha >= 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        img_path = img_dir / f"{stem}.png"
+                        pix.save(str(img_path))
                 except Exception:
-                    logger.debug("Failed to save image: %s", img_path)
+                    logger.debug("Failed to save image xref %s on page %s", xref, page_number)
                     continue
 
                 extracted.append({
                     "image_path": str(img_path),
-                    "page_number": page_num + 1,
-                    "image_index": img_idx,
+                    "page_number": page_number,
                     "width": width,
                     "height": height,
-                    "image_bytes": image_bytes,
-                    "ext": ext,
                 })
-    finally:
-        doc.close()
 
+    (img_dir / _MANIFEST_FILE).write_text(json.dumps(extracted), encoding="utf-8")
     logger.info("Extracted %s significant images from %s", len(extracted), pdf_path)
     return extracted
 
 
-def _describe_image_with_gemini(image_bytes: bytes, page_number: int, retries: int = 2) -> str:
-    """
-    Use Gemini Vision API to generate a text description of an image.
-    Includes retry logic with exponential backoff for rate limits.
-    """
-    if not settings.GOOGLE_API_KEY:
-        return ""
+def _to_jpeg(image_path: str, max_dim: int = 1024) -> bytes:
+    """Downscale and re-encode an image to keep vision requests small."""
+    from PIL import Image
 
-    for attempt in range(retries + 1):
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
+
+def _images_to_describe(pdf_hash: str) -> list[dict]:
+    """The largest images (diagrams, not icons), capped at MAX_IMAGES_TO_DESCRIBE."""
+    manifest = _read_json(_get_image_dir(pdf_hash) / _MANIFEST_FILE, [])
+    manifest.sort(key=lambda i: i["width"] * i["height"], reverse=True)
+    return manifest[:settings.MAX_IMAGES_TO_DESCRIBE]
+
+
+def _to_chunk(image: dict, description: str) -> dict:
+    return {
+        "id": f"img_{Path(image['image_path']).name}",
+        "text": description,
+        "page_number": image["page_number"],
+        "page_end": image["page_number"],
+        "content_type": "image_description",
+        "image_path": image["image_path"],
+    }
+
+
+def describe_images(pdf_hash: str, on_batch: Callable[[list[dict]], None], batch_size: int = 5) -> bool:
+    """
+    Describe pending images one at a time, calling on_batch with new chunks.
+
+    Already-cached descriptions are replayed first (on_batch must be idempotent).
+    Returns True when every image was handled; failed ones are retried next run.
+    """
+    images = _images_to_describe(pdf_hash)
+    cache_path = _get_image_dir(pdf_hash) / _DESCRIPTIONS_FILE
+    descriptions: dict[str, str] = _read_json(cache_path, {})
+
+    def name(image: dict) -> str:
+        return Path(image["image_path"]).name
+
+    cached = [_to_chunk(i, descriptions[name(i)]) for i in images if descriptions.get(name(i))]
+    if cached:
+        on_batch(cached)
+
+    pending = [i for i in images if name(i) not in descriptions]
+    done = len(images) - len(pending)
+    _progress[pdf_hash] = (done, len(images))
+    logger.info("Describing %s images in background (%s already cached)", len(pending), done)
+
+    batch: list[dict] = []
+    failures = 0
+    for image in pending:
         try:
-            import google.generativeai as genai
-            from PIL import Image
-            import io
-
-            genai.configure(api_key=settings.GOOGLE_API_KEY)
-            model = genai.GenerativeModel(settings.GEMINI_VISION_MODEL)
-
-            img = Image.open(io.BytesIO(image_bytes))
-
-            prompt = (
-                f"You are analyzing an image from an engineering/technical textbook (page {page_number}). "
-                "Describe this image in detail for a student studying this material. "
-                "If it's a diagram, explain what it shows and label all components. "
-                "If it's a graph/chart, describe the axes, data trends, and key values. "
-                "If it's a circuit/flowchart, describe the flow and connections. "
-                "If it's a formula or equation, write it out in text. "
-                "If it's a color-coded box (note/warning/definition), transcribe the content. "
-                "Be thorough and technical. Keep response under 400 words."
+            description = llm.describe_image(
+                _to_jpeg(image["image_path"]),
+                _PROMPT.format(page=image["page_number"]),
+                max_tokens=400,
             )
-
-            response = model.generate_content(
-                [prompt, img],
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    max_output_tokens=500,
-                ),
-            )
-            description = response.text.strip()
-            logger.debug("Generated description for page %s image: %s chars", page_number, len(description))
-            return description
-
         except Exception as exc:
-            err_str = str(exc).lower()
-            # Rate limit: back off and retry
-            if "429" in err_str or "quota" in err_str or "rate" in err_str:
-                if attempt < retries:
-                    wait = 2 ** (attempt + 1)  # 2s, 4s
-                    logger.warning("Gemini rate limit hit, retrying in %ss...", wait)
-                    time.sleep(wait)
-                    continue
-            logger.warning("Gemini Vision failed for page %s image: %s", page_number, exc)
-            return ""
-
-    return ""
-
-
-def _describe_image_fallback(image_info: dict) -> str:
-    """Basic description when Gemini Vision is unavailable."""
-    page = image_info.get("page_number", "?")
-    width = image_info.get("width", 0)
-    height = image_info.get("height", 0)
-
-    if width > 0 and height > 0:
-        ratio = width / height
-        if 0.8 <= ratio <= 1.2:
-            shape = "square figure (possibly a diagram)"
-        elif ratio > 2.0:
-            shape = "wide figure (possibly a chart or table)"
-        elif ratio < 0.5:
-            shape = "tall figure (possibly a flowchart)"
-        else:
-            shape = "figure or diagram"
-    else:
-        shape = "figure"
-
-    return (
-        f"[Figure on page {page}]: A {shape} with dimensions {width}x{height}px "
-        "extracted from the textbook. Enable Google API key for detailed description."
-    )
-
-
-def extract_images_as_chunks(
-    pdf_path: str,
-    pdf_hash: str,
-    progress_callback: ProgressCallback | None = None,
-) -> list[dict]:
-    """
-    Main entry point: extracts images from PDF, describes them with Gemini Vision,
-    and returns structured chunks ready for ChromaDB indexing.
-
-    For large PDFs (600+ pages), caps Gemini Vision calls at MAX_IMAGES_TO_DESCRIBE
-    to avoid rate limits. Remaining images get fallback descriptions.
-    """
-    if not settings.ENABLE_IMAGE_EXTRACTION:
-        logger.info("Image extraction disabled in settings.")
-        return []
-
-    if progress_callback:
-        try:
-            progress_callback(0.0, "Extracting images from PDF...")
-        except Exception:
-            pass
-
-    images = _extract_images_from_pdf(pdf_path, pdf_hash)
-    if not images:
-        logger.info("No significant images found in PDF.")
-        return []
-
-    chunks: list[dict] = []
-    total = len(images)
-    max_vision_calls = settings.MAX_IMAGES_TO_DESCRIBE
-
-    logger.info("Describing %s images (Gemini Vision cap: %s)", total, max_vision_calls)
-
-    for i, img_info in enumerate(images):
-        if progress_callback:
-            try:
-                progress_callback((i + 1) / total, f"Describing image {i + 1}/{total}...")
-            except Exception:
-                pass
-
-        # Use Gemini Vision for the most important images (first N by page order)
-        if i < max_vision_calls:
-            description = _describe_image_with_gemini(
-                img_info["image_bytes"],
-                img_info["page_number"],
-            )
-        else:
-            description = ""
-
-        if not description:
-            description = _describe_image_fallback(img_info)
-
-        if not description.strip():
+            failures += 1
+            logger.warning("Vision model failed for %s: %s", name(image), exc)
             continue
 
-        chunks.append({
-            "text": description,
-            "page_number": img_info["page_number"],
-            "content_type": "image_description",
-            "section": f"Figure on page {img_info['page_number']}",
-            "is_important": True,
-            "chunk_index": 0,  # Re-indexed by pdf_processor
-            "image_path": img_info["image_path"],
-        })
+        if description.strip().upper().startswith(_DECORATIVE):
+            description = ""
+        descriptions[name(image)] = description
+        cache_path.write_text(json.dumps(descriptions), encoding="utf-8")
+        if description:
+            batch.append(_to_chunk(image, description))
 
-    logger.info("Generated %s image description chunks from %s images.", len(chunks), total)
-    return chunks
+        done += 1
+        _progress[pdf_hash] = (done, len(images))
+        if len(batch) >= batch_size:
+            on_batch(batch)
+            batch = []
+
+    if batch:
+        on_batch(batch)
+    return failures == 0
+
+
+def start_background_description(pdf_hash: str, on_batch: Callable[[list[dict]], None],
+                                 on_finished: Callable[[], None]) -> None:
+    """Start describing images in a daemon thread (no-op if already running)."""
+    if not settings.ENABLE_IMAGE_EXTRACTION or not settings.GROQ_API_KEY:
+        return
+
+    def run() -> None:
+        try:
+            if describe_images(pdf_hash, on_batch):
+                on_finished()
+        except Exception:
+            logger.exception("Background image description failed for %s", pdf_hash[:12])
+
+    with _workers_lock:
+        worker = _workers.get(pdf_hash)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=run, name=f"describe-{pdf_hash[:8]}", daemon=True)
+        _workers[pdf_hash] = worker
+        worker.start()
+
+
+def description_progress(pdf_hash: str) -> tuple[int, int] | None:
+    """(described, total) while a background worker is running, else None."""
+    worker = _workers.get(pdf_hash)
+    if worker and worker.is_alive():
+        return _progress.get(pdf_hash, (0, 0))
+    return None
 
 
 def get_image_paths_for_pdf(pdf_hash: str) -> list[dict]:
-    """Returns list of all extracted images for a PDF (for UI gallery)."""
-    img_dir = _get_image_dir(pdf_hash)
+    """Returns list of all extracted images for a PDF (for UI gallery), in page order."""
+    img_dir = Path(settings.IMAGE_OUTPUT_DIR) / pdf_hash
     if not img_dir.exists():
         return []
 
     images = []
-    for img_path in sorted(img_dir.iterdir()):
-        if img_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"):
-            parts = img_path.stem.split("_")
-            page_num = 0
-            if len(parts) >= 2:
-                try:
-                    page_num = int(parts[1])
-                except ValueError:
-                    pass
-            images.append({
-                "path": str(img_path),
-                "page_number": page_num,
-                "filename": img_path.name,
-            })
+    for img_path in img_dir.iterdir():
+        if img_path.suffix.lower() not in _IMAGE_SUFFIXES:
+            continue
+        parts = img_path.stem.split("_")
+        page_num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        images.append({
+            "path": str(img_path),
+            "page_number": page_num,
+            "filename": img_path.name,
+        })
 
+    images.sort(key=lambda i: (i["page_number"], i["filename"]))
     return images

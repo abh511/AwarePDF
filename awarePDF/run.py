@@ -1,49 +1,47 @@
 # ============================================================
 # run.py
 # Single command launcher: python run.py
-# Run from the awarePDF/ directory with the venv active, or
-# use the venv directly: .venv/bin/python run.py
+# Works from any directory (always runs from awarePDF/).
 # ============================================================
 
+import os
 import subprocess
 import sys
-import os
 from pathlib import Path
 
-# Ensure we're always running from the directory that contains this file
-# so that app/main.py resolves correctly regardless of where you call it from.
 SCRIPT_DIR = Path(__file__).parent.resolve()
-os.chdir(SCRIPT_DIR)
+os.chdir(SCRIPT_DIR)  # so Streamlit picks up .streamlit/config.toml
 
-
-def check_env():
-    env_path = SCRIPT_DIR / ".env"
-    if not env_path.exists():
-        print("⚠️  WARNING: .env file not found!")
-        print(f"   Run: cp {SCRIPT_DIR}/.env.example {SCRIPT_DIR}/.env")
-        print("   Then fill in your API keys.\n")
-    else:
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(env_path)
-        except ImportError:
-            pass  # dotenv check is best-effort here
-
-        groq_key = os.getenv("GROQ_API_KEY", "")
-        if not groq_key:
-            print("⚠️  GROQ_API_KEY is empty in your .env file!")
-            print("   Get a free key at https://console.groq.com\n")
+# Re-launch with the project's virtual environment if run with another Python
+VENV_PYTHON = SCRIPT_DIR / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != (SCRIPT_DIR / ".venv").resolve():
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def main():
-    check_env()
-    print(f"🚀 Starting AwarePDF at http://localhost:8501")
-    print(f"   Working directory: {SCRIPT_DIR}\n")
+    try:
+        import dotenv, streamlit  # noqa: F401
+    except ImportError:
+        print("❌ Dependencies are not installed. Run:")
+        print(f"   cd {SCRIPT_DIR}")
+        print("   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt")
+        sys.exit(1)
 
+    if not (SCRIPT_DIR / ".env").exists():
+        print("⚠️  .env file not found!")
+        print(f"   Run: cp {SCRIPT_DIR}/.env.example {SCRIPT_DIR}/.env")
+        print("   Then add your free GROQ_API_KEY from https://console.groq.com\n")
+
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from config.settings import GROQ_API_KEY, MAX_UPLOAD_SIZE_MB
+
+    if not GROQ_API_KEY:
+        print("⚠️  GROQ_API_KEY is empty. Get a free key at https://console.groq.com\n")
+
+    print("🚀 Starting AwarePDF at http://localhost:8501\n")
     subprocess.run([
         sys.executable, "-m", "streamlit", "run", "app/main.py",
-        "--server.maxUploadSize", "200",
-        "--server.headless", "false",
+        "--server.maxUploadSize", str(MAX_UPLOAD_SIZE_MB),
     ])
 
 

@@ -3,33 +3,29 @@
 # Extracts key learning points from the PDF
 # ============================================================
 
-from app.core.retriever import retrieve
-from app.core.llm import call_groq, format_context, KEY_POINTS_SYSTEM_PROMPT, KEY_POINTS_USER_TEMPLATE
+from app.core.retriever import chunks_for_topic, sample_across_document
+from app.core.llm import call_llm, format_context, KEY_POINTS_SYSTEM_PROMPT, KEY_POINTS_USER_TEMPLATE
 from app.utils.logger import get_logger
+from config.settings import LLM_MAX_PROMPT_CHARS
 
 logger = get_logger(__name__)
 
 
-def extract_key_points(pdf_hash: str, topic: str = None) -> str:
+def extract_key_points(pdf_hash: str, topic: str | None = None) -> str:
     """
-    Extracts key points from the PDF.
-
-    Args:
-        pdf_hash: PDF identifier
-        topic: Optional - extract key points about a specific topic.
-               If None, gets general key points from important chunks.
+    Extracts key points about `topic`, or across the whole document if None.
     """
-    query = topic if topic else "key concepts definitions important points formulas rules"
-    chunks = retrieve(pdf_hash, query, k=8, use_reranker=True)
+    budget = LLM_MAX_PROMPT_CHARS - 1500
+    if topic:
+        chunks = chunks_for_topic(pdf_hash, topic, max_chars=budget, k=12)
+    else:
+        chunks = sample_across_document(pdf_hash, max_chars=budget)
 
     if not chunks:
         return "No key points found."
 
-    context = format_context(chunks)
-    user_prompt = KEY_POINTS_USER_TEMPLATE.format(context=context)
-
-    return call_groq(
+    return call_llm(
         system_prompt=KEY_POINTS_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
+        user_prompt=KEY_POINTS_USER_TEMPLATE.format(context=format_context(chunks, max_chars=budget)),
         temperature=0.3,
     )

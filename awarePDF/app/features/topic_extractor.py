@@ -1,55 +1,49 @@
 # ============================================================
 # app/features/topic_extractor.py
 # Generates a structured topic list from the PDF
+#
+# Uses the book's real heading outline (in page order) rather
+# than similarity search, so all chapters of a long book appear.
 # ============================================================
 
-from app.core.vector_store import create_or_get_collection, similarity_search
-from app.core.llm import call_groq, format_context, TOPICS_SYSTEM_PROMPT, TOPICS_USER_TEMPLATE
+from app.core.retriever import get_outline, sample_across_document
+from app.core.llm import call_llm, format_context, TOPICS_SYSTEM_PROMPT, TOPICS_USER_TEMPLATE
 from app.utils.logger import get_logger
+from config.settings import LLM_MAX_PROMPT_CHARS
 
 logger = get_logger(__name__)
 
 
 def extract_topics(pdf_hash: str) -> str:
-    """
-    Generates a structured list of topics and subtopics.
+    """Generates a structured list of topics and subtopics."""
+    budget = LLM_MAX_PROMPT_CHARS - 1500
 
-    Strategy: Focus on headings and section titles specifically,
-    since they directly represent the document's topic structure.
-    """
-    collection = create_or_get_collection(pdf_hash)
+    lines: list[str] = []
+    previous = ""
+    for heading in get_outline(pdf_hash):
+        text = heading["text"].strip()
+        if text.lower() != previous.lower():
+            lines.append(f"- {text} (Page {heading['metadata'].get('page_number', '?')})")
+            previous = text
 
-    # Get heading-type chunks first
-    heading_chunks = similarity_search(
-        collection,
-        query="chapter section topic introduction overview",
-        k=20,
-    )
+    if lines:
+        # Evenly thin out very long outlines so the whole book still fits
+        total = sum(len(line) + 1 for line in lines)
+        if total > budget:
+            keep = int(len(lines) * budget / total)
+            step = len(lines) / keep
+            lines = [lines[int(i * step)] for i in range(keep)]
+        context = "\n".join(lines)
+    else:
+        # No headings detected: fall back to sampled content
+        context = format_context(sample_across_document(pdf_hash, max_chars=budget), max_chars=budget)
 
-    # Also get some general content for context
-    general_chunks = similarity_search(
-        collection,
-        query="main topics covered in this document",
-        k=10,
-    )
-
-    # Combine, deduplicate
-    all_chunks = heading_chunks + general_chunks
-    seen_texts = set()
-    unique_chunks = []
-    for chunk in all_chunks:
-        if chunk["text"] not in seen_texts:
-            unique_chunks.append(chunk)
-            seen_texts.add(chunk["text"])
-
-    if not unique_chunks:
+    if not context:
         return "Could not extract topics from the document."
 
-    context = format_context(unique_chunks[:25])
-    user_prompt = TOPICS_USER_TEMPLATE.format(context=context)
-
-    return call_groq(
+    return call_llm(
         system_prompt=TOPICS_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        temperature=0.3,
+        user_prompt=TOPICS_USER_TEMPLATE.format(context=context),
+        temperature=0.2,
+        max_tokens=2500,
     )
