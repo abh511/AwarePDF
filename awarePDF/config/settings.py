@@ -76,6 +76,8 @@ MAX_IMAGES_TO_DESCRIBE: int = int(os.getenv("MAX_IMAGES_TO_DESCRIBE", "150"))
 # --- APP SETTINGS ---
 APP_TITLE: str = os.getenv("APP_TITLE", "AwarePDF")
 MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
+# Web app only: when set, visitors must enter this password (protects your API quota)
+APP_PASSWORD: str = os.getenv("APP_PASSWORD", "")
 
 # --- AUTO-CREATE DIRECTORIES ---
 for directory in (CHROMA_PERSIST_DIR, UPLOAD_DIR, PROCESSED_DIR, IMAGE_OUTPUT_DIR):

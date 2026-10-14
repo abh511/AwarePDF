@@ -13,8 +13,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # then add your free GROQ_API_KEY
-python run.py               # opens http://localhost:8501
+python run.py               # opens http://localhost:8000
 ```
+
+`python run.py --streamlit` starts the original Streamlit UI instead (port 8501). Both share the same data.
 
 Get a free API key (no credit card) at https://console.groq.com/keys.
 
@@ -53,6 +55,39 @@ Question ─► dense search + BM25 keyword search ─► rank fusion ─► cro
 
 All models are open-weight. To swap one, change `LLM_MODEL` or `VISION_MODEL` in `.env` to any model listed at https://console.groq.com/docs/models.
 
+## Web app
+
+The web UI (`awarePDF/web/`) is a single page served by a FastAPI backend (`awarePDF/app/server.py`). It has no build step.
+
+- **Library:** every uploaded book stays available. Drag a PDF anywhere on the page to add one. Processing runs on the server with live progress, so you can close the tab.
+- **Clickable citations:** page references in answers, like (Page 12), open that page in a resizable PDF panel next to the chat.
+- **Answers:** rendered with formulas (KaTeX), tables and code. Each answer shows the figures it used and its source passages.
+- **Study tools:** summary, topics and key points. Results are kept per book, and you can copy them or download them as Markdown.
+- **Figures:** a gallery you can filter by page range, with a lightbox (arrow keys move between figures).
+- Light and dark themes, a mobile layout, and keyboard shortcuts (<kbd>/</kbd> focuses the question box, <kbd>Esc</kbd> closes panels).
+
+## Deploy
+
+The app is one container. It needs about **6 GB of RAM** while parsing a large book (Docling's layout models) and a **persistent disk** for `/app/data`. That disk holds uploads, the vector index, extracted figures and the downloaded models.
+
+```bash
+cd awarePDF
+docker build -t awarepdf .
+docker run -d -p 8000:8000 \
+  -e GROQ_API_KEY=your_key \
+  -e APP_PASSWORD=choose-a-password \
+  -v awarepdf-data:/app/data \
+  awarepdf
+```
+
+- **Set `APP_PASSWORD` on any public deployment.** Without it, anyone with the URL can upload books and use up your Groq quota. With it, visitors see a login screen, and every API route needs the session cookie.
+- The container listens on `$PORT` (default 8000), so it works as-is on hosts that set `PORT`, such as Render, Railway, Fly.io or a VPS behind a reverse proxy.
+- Run a **single worker**. Processing jobs and progress are held in memory.
+- If you use a reverse proxy, allow request bodies up to `MAX_UPLOAD_SIZE_MB` (nginx: `client_max_body_size 200m;`).
+- Free tiers with 512 MB to 1 GB of RAM can't parse large books. Use an instance with at least 8 GB.
+
+Without Docker: `pip install -r requirements.txt`, then `uvicorn app.server:app --host 0.0.0.0 --port 8000` from `awarePDF/`.
+
 ## Large books: what to expect
 
 Measured on a 1,126-page textbook (CPU parsing, GPU embeddings):
@@ -78,6 +113,7 @@ All settings live in `awarePDF/.env` (see `.env.example`). The ones you are most
 | `TABLE_MODE` | `fast` | Use `accurate` for table-heavy books. |
 | `MAX_IMAGES_TO_DESCRIBE` | `150` | Largest figures first. The rest still appear in the gallery. |
 | `ENABLE_IMAGE_EXTRACTION` | `True` | Set `False` to skip figures entirely. |
+| `APP_PASSWORD` | (none) | Web app login. Set it before deploying publicly. |
 | `RETRIEVAL_K` | `6` | Number of chunks given to the LLM per question. |
 | `LLM_MAX_PROMPT_CHARS` | `16000` | Keeps requests within the free tier's per-minute token limit. |
 
@@ -85,12 +121,14 @@ All settings live in `awarePDF/.env` (see `.env.example`). The ones you are most
 
 ```
 awarePDF/
-├── run.py                  # launcher: python run.py
+├── run.py                  # launcher: python run.py (--streamlit for the old UI)
+├── Dockerfile              # one-container deployment
 ├── requirements.txt
 ├── .env.example            # copy to .env
 ├── .streamlit/config.toml  # theme + upload limit
 ├── config/settings.py      # every setting, read from .env
 ├── app/
+│   ├── server.py           # FastAPI backend for the web UI
 │   ├── main.py             # Streamlit entry point
 │   ├── core/
 │   │   ├── pdf_processor.py    # Docling parsing in page batches
@@ -105,6 +143,7 @@ awarePDF/
 │   ├── features/           # qa, summarizer, topic_extractor, key_points
 │   ├── ui/                 # sidebar, chat, features views
 │   └── utils/              # logger, file hashing, device selection
+├── web/                    # web UI: index.html, styles.css, app.js
 ├── tests/                  # pytest suite
 └── data/                   # generated: uploads, cache, vector DB, images (git-ignored)
 ```

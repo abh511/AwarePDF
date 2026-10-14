@@ -1,5 +1,8 @@
-# App
+# App (web UI: FastAPI; legacy UI: Streamlit)
 streamlit>=1.45
+fastapi>=0.115,<0.136
+uvicorn[standard]
+python-multipart
 python-dotenv
 Pillow
 rich
